@@ -77,6 +77,40 @@ async def _collect_history(
     return count
 
 
+def _create_daily_stats_table(conn: sqlite3.Connection) -> None:
+    """
+    Crée la table daily_stats si elle n'existe pas encore.
+
+    Cette table agrège le nombre de messages par jour,
+    calculé à partir des données de la table messages.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            date TEXT PRIMARY KEY,
+            message_count INTEGER
+        )
+    """)
+    conn.commit()
+
+
+def _populate_daily_stats(conn: sqlite3.Connection) -> None:
+    """
+    Remplit la table daily_stats en agrégeant les messages par jour.
+
+    Utilise INSERT OR REPLACE pour mettre à jour les comptages
+    si la commande count est relancée sur une période déjà traitée.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO daily_stats (date, message_count)
+        SELECT date(date), COUNT(*)
+        FROM messages
+        GROUP BY date(date)
+    """)
+    conn.commit()
+
+
 @bot.command()
 async def count(ctx: commands.Context) -> None:
     """
@@ -135,6 +169,10 @@ async def count(ctx: commands.Context) -> None:
     # Insertion du reste du buffer (inférieur à BUFFER_SIZE)
     if buffer:
         _store_buffer(conn, buffer)
+
+    # Mise à jour des statistiques quotidiennes
+    _create_daily_stats_table(conn)
+    _populate_daily_stats(conn)
 
     conn.close()
 
