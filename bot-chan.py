@@ -45,7 +45,8 @@ async def _collect_history(
     buffer: list,
     conn: sqlite3.Connection,
     begin_date: datetime,
-    end_date: datetime
+    end_date: datetime,
+    total_so_far: int = 0
 ) -> int:
     """
     Parcourt l'historique d'un salon ou fil et alimente le buffer de messages.
@@ -62,6 +63,8 @@ async def _collect_history(
         conn: La connexion SQLite active.
         begin_date: Date de début de la période (incluse).
         end_date: Date de fin de la période (exclue).
+        total_so_far: Nombre de messages déjà comptés sur le serveur,
+                      pour afficher un compteur global continu dans les logs.
 
     Returns:
         Le nombre de messages collectés depuis cette source.
@@ -73,42 +76,8 @@ async def _collect_history(
             _store_buffer(conn, buffer)
             buffer.clear()
         count += 1
-        print(f"{count} messages comptés ({label}).")
+        print(f"{total_so_far + count} messages comptés ({label}).")
     return count
-
-
-def _create_daily_stats_table(conn: sqlite3.Connection) -> None:
-    """
-    Crée la table daily_stats si elle n'existe pas encore.
-
-    Cette table agrège le nombre de messages par jour,
-    calculé à partir des données de la table messages.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            date TEXT PRIMARY KEY,
-            message_count INTEGER
-        )
-    """)
-    conn.commit()
-
-
-def _populate_daily_stats(conn: sqlite3.Connection) -> None:
-    """
-    Remplit la table daily_stats en agrégeant les messages par jour.
-
-    Utilise INSERT OR REPLACE pour mettre à jour les comptages
-    si la commande count est relancée sur une période déjà traitée.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO daily_stats (date, message_count)
-        SELECT date(date), COUNT(*)
-        FROM messages
-        GROUP BY date(date)
-    """)
-    conn.commit()
 
 
 @bot.command()
@@ -129,9 +98,10 @@ async def count(ctx: commands.Context) -> None:
 
     buffer: list[tuple] = []
 
-    # Période de comptage — à modifier selon vos besoins
-    begin_date = datetime(2026, 2, 1)
-    end_date = datetime(2026, 3, 1)
+    # Période de comptage — dates localisées en heure de Paris pour éviter
+    # le décalage UTC qui fausserait le comptage des premiers et derniers jours
+    begin_date = paris_tz.localize(datetime(2026, 3, 1))
+    end_date = paris_tz.localize(datetime(2026, 3, 4))
     previous_day = end_date - timedelta(days=1)
 
     msg = (
@@ -150,21 +120,21 @@ async def count(ctx: commands.Context) -> None:
 
     # --- Salons textuels ---
     for channel in server.text_channels:
-        count_messages += await _collect_history(channel, channel.name, "salon", buffer, conn, begin_date, end_date)
+        count_messages += await _collect_history(channel, channel.name, "salon", buffer, conn, begin_date, end_date, count_messages)
 
         # Fils actifs rattachés au salon
         for thread in channel.threads:
-            count_messages += await _collect_history(thread, thread.name, "fils actif", buffer, conn, begin_date, end_date)
+            count_messages += await _collect_history(thread, thread.name, "fils actif", buffer, conn, begin_date, end_date, count_messages)
 
         # Fils archivés rattachés au salon
         async for thread in channel.archived_threads(limit=None):
-            count_messages += await _collect_history(thread, thread.name, "fils archivé", buffer, conn, begin_date, end_date)
+            count_messages += await _collect_history(thread, thread.name, "fils archivé", buffer, conn, begin_date, end_date, count_messages)
 
     # --- Salons vocaux avec chat textuel ---
     for voice_channel in server.voice_channels:
         # last_message_id est None si le salon vocal n'a jamais reçu de message texte
         if voice_channel.last_message_id:
-            count_messages += await _collect_history(voice_channel, voice_channel.name, "salon vocal", buffer, conn, begin_date, end_date)
+            count_messages += await _collect_history(voice_channel, voice_channel.name, "salon vocal", buffer, conn, begin_date, end_date, count_messages)
 
     # Insertion du reste du buffer (inférieur à BUFFER_SIZE)
     if buffer:
@@ -245,6 +215,46 @@ def _store_buffer(conn: sqlite3.Connection, messages_buffer: list[tuple]) -> Non
         conn.commit()
     except sqlite3.Error as e:
         print(f"Erreur SQL: {e}")
+
+
+def _create_daily_stats_table(conn: sqlite3.Connection) -> None:
+    """
+    Crée la table daily_stats si elle n'existe pas encore.
+
+    Cette table agrège le nombre de messages par jour,
+    calculé à partir des données de la table messages.
+
+    Args:
+        conn: La connexion SQLite active.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            date TEXT PRIMARY KEY,
+            message_count INTEGER
+        )
+    """)
+    conn.commit()
+
+
+def _populate_daily_stats(conn: sqlite3.Connection) -> None:
+    """
+    Remplit la table daily_stats en agrégeant les messages par jour.
+
+    Utilise INSERT OR REPLACE pour mettre à jour les comptages
+    si la commande count est relancée sur une période déjà traitée.
+
+    Args:
+        conn: La connexion SQLite active.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO daily_stats (date, message_count)
+        SELECT date(date), COUNT(*)
+        FROM messages
+        GROUP BY date(date)
+    """)
+    conn.commit()
 
 
 async def main() -> None:
