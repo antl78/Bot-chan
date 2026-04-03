@@ -1,5 +1,8 @@
 import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
 
 import discord
 from discord.ext import commands
@@ -46,7 +49,7 @@ async def _collect_history(
     conn: sqlite3.Connection,
     begin_date: datetime,
     end_date: datetime,
-    total_so_far: int = 0
+    total_so_far: int = 0,
 ) -> int:
     """
     Parcourt l'historique d'un salon ou fil et alimente le buffer de messages.
@@ -120,21 +123,57 @@ async def count(ctx: commands.Context) -> None:
 
     # --- Salons textuels ---
     for channel in server.text_channels:
-        count_messages += await _collect_history(channel, channel.name, "salon", buffer, conn, begin_date, end_date, count_messages)
+        count_messages += await _collect_history(
+            channel,
+            channel.name,
+            "salon",
+            buffer,
+            conn,
+            begin_date,
+            end_date,
+            count_messages,
+        )
 
         # Fils actifs rattachés au salon
         for thread in channel.threads:
-            count_messages += await _collect_history(thread, thread.name, "fils actif", buffer, conn, begin_date, end_date, count_messages)
+            count_messages += await _collect_history(
+                thread,
+                thread.name,
+                "fils actif",
+                buffer,
+                conn,
+                begin_date,
+                end_date,
+                count_messages,
+            )
 
         # Fils archivés rattachés au salon
         async for thread in channel.archived_threads(limit=None):
-            count_messages += await _collect_history(thread, thread.name, "fils archivé", buffer, conn, begin_date, end_date, count_messages)
+            count_messages += await _collect_history(
+                thread,
+                thread.name,
+                "fils archivé",
+                buffer,
+                conn,
+                begin_date,
+                end_date,
+                count_messages,
+            )
 
     # --- Salons vocaux avec chat textuel ---
     for voice_channel in server.voice_channels:
         # last_message_id est None si le salon vocal n'a jamais reçu de message texte
         if voice_channel.last_message_id:
-            count_messages += await _collect_history(voice_channel, voice_channel.name, "salon vocal", buffer, conn, begin_date, end_date, count_messages)
+            count_messages += await _collect_history(
+                voice_channel,
+                voice_channel.name,
+                "salon vocal",
+                buffer,
+                conn,
+                begin_date,
+                end_date,
+                count_messages,
+            )
 
     # Insertion du reste du buffer (inférieur à BUFFER_SIZE)
     if buffer:
@@ -149,11 +188,14 @@ async def count(ctx: commands.Context) -> None:
     # Calcul du temps d'exécution total
     elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
     time_str = (
-        f"{elapsed:.2f} sec" if elapsed < 60
+        f"{elapsed:.2f} sec"
+        if elapsed < 60
         else f"{int(elapsed // 60)} min {int(elapsed % 60)} sec"
     )
 
-    await ctx.send(f"Nombre de messages comptés : {count_messages}\nTemps d'exécution : {time_str}")
+    await ctx.send(
+        f"Nombre de messages comptés : {count_messages}\nTemps d'exécution : {time_str}"
+    )
 
 
 def _build_row(message: discord.Message, channel_name: str) -> tuple:
@@ -170,17 +212,16 @@ def _build_row(message: discord.Message, channel_name: str) -> tuple:
     Returns:
         Un tuple (id, auteur, date, contenu, salon, réactions).
     """
-    reactions = str([
-        {"emoji": str(r.emoji), "count": r.count}
-        for r in message.reactions
-    ])
+    reactions = str(
+        [{"emoji": str(r.emoji), "count": r.count} for r in message.reactions]
+    )
     return (
         message.id,
         message.author.name,
-        message.created_at.astimezone(paris_tz).strftime('%Y-%m-%d %H:%M:%S'),
+        message.created_at.astimezone(paris_tz).strftime("%Y-%m-%d %H:%M:%S"),
         message.content,
         channel_name,
-        reactions
+        reactions,
     )
 
 
@@ -210,7 +251,7 @@ def _store_buffer(conn: sqlite3.Connection, messages_buffer: list[tuple]) -> Non
         print(f"Insertion de {len(messages_buffer)} messages dans la table messages.")
         cur.executemany(
             "INSERT OR IGNORE INTO messages (id, author, date, content, channel, reactions) VALUES (?, ?, ?, ?, ?, ?)",
-            messages_buffer
+            messages_buffer,
         )
         conn.commit()
     except sqlite3.Error as e:
