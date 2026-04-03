@@ -1,18 +1,22 @@
+import asyncio
+import os
+import sqlite3
+import time
+from datetime import datetime, timedelta
 import logging
+
+import discord
+import pytz
+from discord.ext import commands
+from dotenv import load_dotenv
+
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 
-import discord
-from discord.ext import commands
-from datetime import datetime, timedelta
-import sqlite3
-import time
-import os
-import asyncio
-import pytz
-from dotenv import load_dotenv
+
 
 # Chargement des variables d'environnement depuis le fichier .env (en local)
 # Sur Railway, ces variables sont définies directement dans l'interface web
@@ -72,15 +76,15 @@ async def _collect_history(
     Returns:
         Le nombre de messages collectés depuis cette source.
     """
-    count = 0
+    message_count = 0
     async for message in source.history(limit=None, after=begin_date, before=end_date):
         buffer.append(_build_row(message, name))
         if len(buffer) >= BUFFER_SIZE:
             _store_buffer(conn, buffer)
             buffer.clear()
-        count += 1
-        print(f"{total_so_far + count} messages comptés ({label}).")
-    return count
+        message_count += 1
+        print(f"{total_so_far + message_count} messages comptés ({label}).")
+    return message_count
 
 
 @bot.command()
