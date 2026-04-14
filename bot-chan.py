@@ -4,6 +4,8 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 import logging
+import random
+from pathlib import Path
 
 import discord
 import pytz
@@ -29,6 +31,10 @@ BUFFER_SIZE = 1000
 # Chemin vers le fichier SQLite, configurable via variable d'environnement
 # Par défaut : messages.db dans le répertoire courant
 DB_PATH = os.getenv("DB_PATH", "messages.db")
+
+# Chemin vers le dossier contenant les images de dédicaces
+# Par défaut : sous-dossier "dedis" dans le répertoire courant
+DEDIS_PATH = Path(os.getenv("DEDIS_PATH", "dedis"))
 
 
 # Liste des IDs Discord autorisés à lancer la commande count.
@@ -300,6 +306,12 @@ async def help_command(ctx: commands.Context) -> None:
     )
 
     embed.add_field(
+        name="`/botchan dedicace`",
+        value="Affiche une image de dédicace qui a marqué la commu kj.",
+        inline=False,
+    )
+
+    embed.add_field(
         name="`/botchan help`",
         value="Affiche ce message d'aide.",
         inline=False,
@@ -310,6 +322,34 @@ async def help_command(ctx: commands.Context) -> None:
     )
 
     await ctx.send(embed=embed)
+
+
+@bot.command(name="dedicace")
+async def dedicace_command(ctx: commands.Context) -> None:
+    """
+    Commande publique : envoie une image de dédicace tirée au hasard
+    depuis le dossier DEDIS_PATH.
+
+    Usage:
+        /botchan dedicace
+
+    Les formats supportés sont : JPG, JPEG, PNG, GIF, WEBP.
+    Si le dossier est introuvable ou vide, envoie un message d'erreur discret.
+    """
+    extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+    if not DEDIS_PATH.is_dir():
+        await ctx.send("❌ Le dossier de dédicaces est introuvable. Contacte un admin !")
+        return
+
+    images = [f for f in DEDIS_PATH.iterdir() if f.suffix.lower() in extensions]
+
+    if not images:
+        await ctx.send("📭 Aucune dédicace disponible pour le moment...")
+        return
+
+    chosen = random.choice(images)
+    await ctx.send(file=discord.File(chosen))
 
 
 def _build_row(message: discord.Message, channel_name: str) -> tuple:
