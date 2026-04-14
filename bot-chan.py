@@ -42,7 +42,12 @@ ALLOWED_USER_IDS: set[int] = {
 # Configuration des intents Discord : détermine quels événements le bot peut recevoir
 # Intents.all() est nécessaire pour accéder à l'historique des messages et aux fils archivés
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="/botchan ", description="Bot-chan", intents=intents)
+bot = commands.Bot(
+    command_prefix="/botchan ",
+    description="Bot-chan",
+    intents=intents,
+    help_command=None,  # désactive le help par défaut
+)
 
 
 def allowed_users_only():
