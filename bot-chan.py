@@ -254,6 +254,19 @@ async def count(ctx: commands.Context, begin: str, end: str) -> None:
         f"Nombre de messages comptés : {count_messages}\nTemps d'exécution : {time_str}"
     )
 
+@count.error
+async def count_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    """Gestionnaire d'erreurs pour la commande count."""
+    if isinstance(error, (commands.MissingRequiredArgument, commands.TooManyArguments)):
+        await ctx.send(
+            "❌ Paramètres invalides. Utilise : `/botchan count YYYY-MM-DD YYYY-MM-DD`\n"
+            "Exemple : `/botchan count 2026-03-01 2026-03-31`"
+        )
+    elif isinstance(error, commands.CheckFailure):
+        pass  # Déjà géré dans allowed_users_only()
+    else:
+        await ctx.send(f"❌ Une erreur inattendue s'est produite : {error}")
+
 
 def _build_row(message: discord.Message, channel_name: str) -> tuple:
     """
