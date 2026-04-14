@@ -3,6 +3,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
+from functools import wraps
 import logging
 
 import discord
@@ -33,10 +34,36 @@ BUFFER_SIZE = 1000
 # Par défaut : messages.db dans le répertoire courant
 DB_PATH = os.getenv("DB_PATH", "messages.db")
 
+# Liste des IDs Discord autorisés à lancer la commande count.
+# Format dans .env : ALLOWED_USERS=123456789,987654321
+# Si la variable est absente ou vide, personne ne peut lancer la commande.
+_raw_allowed = os.getenv("ALLOWED_USERS", "")
+ALLOWED_USER_IDS: set[int] = {
+    int(uid.strip()) for uid in _raw_allowed.split(",") if uid.strip().isdigit()
+}
+
 # Configuration des intents Discord : détermine quels événements le bot peut recevoir
 # Intents.all() est nécessaire pour accéder à l'historique des messages et aux fils archivés
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="/botchan ", description="Bot-chan", intents=intents)
+
+
+def allowed_users_only():
+    """
+    Decorator de vérification : n'autorise l'exécution de la commande que si
+    l'ID de l'auteur figure dans ALLOWED_USER_IDS.
+
+    En cas de refus, envoie un message d'erreur discret dans le salon
+    et lève une exception pour bloquer l'exécution de la commande.
+    """
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.author.id not in ALLOWED_USER_IDS:
+            await ctx.send(
+                f"⛔ Désolée {ctx.author.mention}, tu n'es pas autorisé(e) à utiliser cette commande."
+            )
+            return False
+        return True
+    return commands.check(predicate)
 
 
 @bot.event
@@ -88,10 +115,22 @@ async def _collect_history(
 
 
 @bot.command()
-async def count(ctx: commands.Context) -> None:
+@allowed_users_only()
+async def count(ctx: commands.Context, begin: str, end: str) -> None:
     """
     Commande principale : parcourt tous les salons du serveur sur une période donnée,
     compte les messages et les stocke dans une base de données SQLite.
+
+    Usage:
+        /botchan count YYYY-MM-DD YYYY-MM-DD
+
+    Exemples:
+        /botchan count 2026-03-01 2026-03-31   → tout le mois de mars 2026
+        /botchan count 2026-01-01 2026-01-31   → tout le mois de janvier 2026
+
+    Args:
+        begin: Date de début au format YYYY-MM-DD (incluse).
+        end:   Date de fin au format YYYY-MM-DD (incluse).
 
     Couvre :
     - Les salons textuels
@@ -101,20 +140,34 @@ async def count(ctx: commands.Context) -> None:
     Envoie un message de confirmation au début, puis un résumé à la fin
     avec le nombre de messages comptés et le temps d'exécution.
     """
+    # --- Validation et parsing des dates ---
+    try:
+        begin_date = paris_tz.localize(datetime.strptime(begin, "%Y-%m-%d"))
+        # On ajoute un jour à end_date pour que la date saisie soit incluse dans le comptage
+        # (discord.py traite `before` comme exclusif)
+        end_date = paris_tz.localize(datetime.strptime(end, "%Y-%m-%d")) + timedelta(days=1)
+    except ValueError:
+        await ctx.send(
+            "❌ Format de date invalide. Utilise : `/botchan count YYYY-MM-DD YYYY-MM-DD`\n"
+            "Exemple : `/botchan count 2026-03-01 2026-03-31`"
+        )
+        return
+
+    if end_date <= begin_date:
+        await ctx.send("❌ La date de fin doit être strictement après la date de début.")
+        return
+
     start = time.perf_counter_ns()
 
     buffer: list[tuple] = []
 
-    # Période de comptage — dates localisées en heure de Paris pour éviter
-    # le décalage UTC qui fausserait le comptage des premiers et derniers jours
-    begin_date = paris_tz.localize(datetime(2026, 3, 1))
-    end_date = paris_tz.localize(datetime(2026, 3, 4))
-    previous_day = end_date - timedelta(days=1)
-
+    # end_date a été décalée d'un jour en interne pour rendre la borne inclusive ;
+    # on soustrait ce jour pour afficher la date telle que l'utilisateur l'a saisie.
+    display_end = end_date - timedelta(days=1)
     msg = (
         f"Bot-chan commence le comptage, l'opération prendra un peu de temps. <:botchan:1062835070903271476>\n"
         f"Début du comptage : {begin_date.strftime('%d/%m/%Y')}\n"
-        f"Fin du comptage : {previous_day.strftime('%d/%m/%Y')}"
+        f"Fin du comptage : {display_end.strftime('%d/%m/%Y')}"
     )
     await ctx.send(msg)
 
