@@ -3,7 +3,6 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
-from functools import wraps
 import logging
 
 import discord
@@ -11,12 +10,9 @@ import pytz
 from discord.ext import commands
 from dotenv import load_dotenv
 
-
-
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
-
 
 
 # Chargement des variables d'environnement depuis le fichier .env (en local)
@@ -33,6 +29,7 @@ BUFFER_SIZE = 1000
 # Chemin vers le fichier SQLite, configurable via variable d'environnement
 # Par défaut : messages.db dans le répertoire courant
 DB_PATH = os.getenv("DB_PATH", "messages.db")
+
 
 # Liste des IDs Discord autorisés à lancer la commande count.
 # Format dans .env : ALLOWED_USERS=123456789,987654321
@@ -56,6 +53,7 @@ def allowed_users_only():
     En cas de refus, envoie un message d'erreur discret dans le salon
     et lève une exception pour bloquer l'exécution de la commande.
     """
+
     async def predicate(ctx: commands.Context) -> bool:
         if ctx.author.id not in ALLOWED_USER_IDS:
             await ctx.send(
@@ -63,6 +61,7 @@ def allowed_users_only():
             )
             return False
         return True
+
     return commands.check(predicate)
 
 
@@ -145,7 +144,9 @@ async def count(ctx: commands.Context, begin: str, end: str) -> None:
         begin_date = paris_tz.localize(datetime.strptime(begin, "%Y-%m-%d"))
         # On ajoute un jour à end_date pour que la date saisie soit incluse dans le comptage
         # (discord.py traite `before` comme exclusif)
-        end_date = paris_tz.localize(datetime.strptime(end, "%Y-%m-%d")) + timedelta(days=1)
+        end_date = paris_tz.localize(datetime.strptime(end, "%Y-%m-%d")) + timedelta(
+            days=1
+        )
     except ValueError:
         await ctx.send(
             "❌ Format de date invalide. Utilise : `/botchan count YYYY-MM-DD YYYY-MM-DD`\n"
@@ -154,7 +155,9 @@ async def count(ctx: commands.Context, begin: str, end: str) -> None:
         return
 
     if end_date <= begin_date:
-        await ctx.send("❌ La date de fin doit être strictement après la date de début.")
+        await ctx.send(
+            "❌ La date de fin doit être strictement après la date de début."
+        )
         return
 
     start = time.perf_counter_ns()
@@ -254,6 +257,7 @@ async def count(ctx: commands.Context, begin: str, end: str) -> None:
         f"Nombre de messages comptés : {count_messages}\nTemps d'exécution : {time_str}"
     )
 
+
 @count.error
 async def count_error(ctx: commands.Context, error: commands.CommandError) -> None:
     """Gestionnaire d'erreurs pour la commande count."""
@@ -266,6 +270,41 @@ async def count_error(ctx: commands.Context, error: commands.CommandError) -> No
         pass  # Déjà géré dans allowed_users_only()
     else:
         await ctx.send(f"❌ Une erreur inattendue s'est produite : {error}")
+
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context) -> None:
+    """
+    Commande d'aide : affiche la liste des commandes disponibles avec leur syntaxe.
+    """
+    embed = discord.Embed(
+        title="📖 Aide — Bot-chan",
+        description="Voici la liste des commandes disponibles.",
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="`/botchan count <début> <fin>`",
+        value=(
+            "Parcourt tous les salons du serveur sur la période indiquée, "
+            "compte les messages et les stocke dans la base de données SQLite.\n"
+            "• `<début>` et `<fin>` au format `YYYY-MM-DD` (les deux bornes sont incluses)\n"
+            "📌 Exemple : `/botchan count 2026-03-01 2026-03-31`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="`/botchan help`",
+        value="Affiche ce message d'aide.",
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Bot-chan • Seuls les admins/modos peuvent utiliser la commande count."
+    )
+
+    await ctx.send(embed=embed)
 
 
 def _build_row(message: discord.Message, channel_name: str) -> tuple:
