@@ -364,10 +364,13 @@ def _build_row(message: discord.Message, channel_name: str) -> tuple:
         channel_name: Le nom du salon ou fil dans lequel le message se trouve.
 
     Returns:
-        Un tuple (id, auteur, date, contenu, salon, réactions).
+        Un tuple (id, auteur, date, contenu, salon, réactions, reply_to_message_id).
     """
     reactions = str(
         [{"emoji": str(r.emoji), "count": r.count} for r in message.reactions]
+    )
+    reply_to_message_id = (
+        message.reference.message_id if message.reference is not None else None
     )
     return (
         message.id,
@@ -376,6 +379,7 @@ def _build_row(message: discord.Message, channel_name: str) -> tuple:
         message.content,
         channel_name,
         reactions,
+        reply_to_message_id,
     )
 
 
@@ -398,13 +402,14 @@ def _store_buffer(conn: sqlite3.Connection, messages_buffer: list[tuple]) -> Non
             date TEXT,
             content TEXT,
             channel TEXT,
-            reactions TEXT
+            reactions TEXT,
+            reply_to_message_id INTEGER
         )
     """)
     try:
         print(f"Insertion de {len(messages_buffer)} messages dans la table messages.")
         cur.executemany(
-            "INSERT OR IGNORE INTO messages (id, author, date, content, channel, reactions) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO messages (id, author, date, content, channel, reactions, reply_to_message_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             messages_buffer,
         )
         conn.commit()
