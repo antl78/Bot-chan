@@ -6,4 +6,6 @@ __pycache__/
 .idea/
 tests/
 SQL_commandes/
+csv/
+screens/
 
