@@ -1,20 +1,37 @@
 import asyncio
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timedelta
 import logging
 import random
 from pathlib import Path
 
+# Configuration des logs console.
+# Les consoles comme celle de PyCharm affichent en rouge tout ce qui passe par stderr :
+# on envoie donc les messages normaux (INFO, WARNING) sur stdout et seulement les
+# erreurs (ERROR, CRITICAL) sur stderr, pour qu'elles ressortent en rouge.
+# Cette configuration doit être faite AVANT d'importer discord : discord.py émet des
+# avertissements dès son import (PyNaCl absent…), qui partiraient sinon sur stderr.
+_log_format = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setFormatter(_log_format)
+_stdout_handler.addFilter(lambda record: record.levelno < logging.ERROR)
+
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setFormatter(_log_format)
+_stderr_handler.setLevel(logging.ERROR)
+
+logging.basicConfig(level=logging.INFO, handlers=[_stdout_handler, _stderr_handler])
+logger = logging.getLogger("bot-chan")
+
+import aiohttp
 import discord
 import pytz
 from discord.ext import commands
 from dotenv import load_dotenv
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-)
 
 
 # Chargement des variables d'environnement depuis le fichier .env (en local)
@@ -27,6 +44,26 @@ paris_tz = pytz.timezone("Europe/Paris")
 # Nombre de messages accumulés en mémoire avant chaque écriture en base de données
 # Plus la valeur est grande, moins il y a d'écritures disque, mais plus la mémoire est sollicitée
 BUFFER_SIZE = 1000
+
+# Fréquence d'affichage de la progression dans la console (tous les N messages).
+# Afficher une ligne par message ralentit fortement le comptage sous Windows.
+PROGRESS_EVERY = 1000
+
+# Erreurs considérées comme temporaires : on réessaie au lieu d'abandonner le comptage.
+# - DiscordServerError : erreurs 5xx renvoyées par Discord (500, 502, 503, 504)
+# - aiohttp.ClientError : connexion coupée, serveur déconnecté, DNS indisponible…
+# - asyncio.TimeoutError / OSError : délai dépassé, réseau injoignable
+TRANSIENT_ERRORS = (
+    discord.DiscordServerError,
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    OSError,
+)
+
+# Nombre maximal de tentatives consécutives avant d'abandonner,
+# et délai d'attente maximal entre deux tentatives (en secondes).
+MAX_RETRIES = 8
+MAX_RETRY_DELAY = 120
 
 # Chemin vers le fichier SQLite, configurable via variable d'environnement
 # Par défaut : messages.db dans le répertoire courant
@@ -79,7 +116,8 @@ def allowed_users_only():
 @bot.event
 async def on_ready() -> None:
     """Événement déclenché quand le bot est connecté et prêt à recevoir des commandes."""
-    print(f"Bot-chan est opérationnelle. Connectée en tant que {bot.user}")
+    # on_ready peut aussi se déclencher après une reconnexion à Discord
+    logger.info("Bot-chan est opérationnelle. Connectée en tant que %s", bot.user)
 
 
 async def _collect_history(
@@ -112,20 +150,118 @@ async def _collect_history(
 
     Returns:
         Le nombre de messages collectés depuis cette source.
+
+    En cas d'erreur temporaire (Discord indisponible, coupure réseau…), le parcours
+    reprend après le dernier message déjà traité, après une attente croissante
+    (2 s, 4 s, 8 s… plafonnée à MAX_RETRY_DELAY). Aucun message n'est compté deux fois.
+    Si le bot n'a pas accès à la source (403), elle est ignorée avec un avertissement.
     """
     message_count = 0
-    async for message in source.history(limit=None, after=begin_date, before=end_date):
-        buffer.append(_build_row(message, name))
-        if len(buffer) >= BUFFER_SIZE:
-            _store_buffer(conn, buffer)
-            buffer.clear()
-        message_count += 1
-        print(f"{total_so_far + message_count} messages comptés ({label}).")
-    return message_count
+    # Point de reprise : on repart après le dernier message traité.
+    # Avec `after`, discord.py parcourt l'historique du plus ancien au plus récent.
+    resume_after: datetime | discord.Message = begin_date
+    attempt = 0
+
+    while True:
+        try:
+            async for message in source.history(
+                limit=None, after=resume_after, before=end_date
+            ):
+                buffer.append(_build_row(message, name))
+                if len(buffer) >= BUFFER_SIZE:
+                    _store_buffer(conn, buffer)
+                    buffer.clear()
+                message_count += 1
+                resume_after = message
+                attempt = 0  # le parcours avance de nouveau : on remet le compteur à zéro
+                if (total_so_far + message_count) % PROGRESS_EVERY == 0:
+                    logger.info(
+                        "%d messages comptés (%s : %s).",
+                        total_so_far + message_count,
+                        label,
+                        name,
+                    )
+            return message_count
+
+        except discord.Forbidden:
+            logger.warning("Accès refusé au %s « %s » : ignoré.", label, name)
+            return message_count
+
+        except TRANSIENT_ERRORS as e:
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                logger.error(
+                    "Abandon sur le %s « %s » après %d tentatives.",
+                    label,
+                    name,
+                    MAX_RETRIES,
+                )
+                raise
+            delay = _retry_delay(attempt)
+            logger.warning(
+                "Erreur temporaire sur le %s « %s » (%s). "
+                "Reprise dans %d s (tentative %d/%d).",
+                label,
+                name,
+                e,
+                delay,
+                attempt,
+                MAX_RETRIES,
+            )
+            await asyncio.sleep(delay)
+
+
+def _retry_delay(attempt: int) -> int:
+    """Délai avant la tentative n° `attempt` : 2, 4, 8… plafonné à MAX_RETRY_DELAY."""
+    return min(2**attempt, MAX_RETRY_DELAY)
+
+
+async def _list_archived_threads(
+    channel: discord.TextChannel,
+) -> list[discord.Thread]:
+    """
+    Récupère la liste des fils archivés publics d'un salon.
+
+    La liste est récupérée en entier avant le parcours des messages, ce qui permet
+    de la redemander depuis le début en cas d'erreur temporaire sans effet de bord.
+
+    Args:
+        channel: Le salon textuel dont on veut les fils archivés.
+
+    Returns:
+        La liste des fils archivés (vide si le bot n'y a pas accès).
+    """
+    attempt = 0
+    while True:
+        try:
+            return [thread async for thread in channel.archived_threads(limit=None)]
+        except discord.Forbidden:
+            logger.warning(
+                "Accès refusé aux fils archivés du salon « %s » : ignorés.",
+                channel.name,
+            )
+            return []
+        except TRANSIENT_ERRORS as e:
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                raise
+            delay = _retry_delay(attempt)
+            logger.warning(
+                "Erreur temporaire sur les fils archivés de « %s » (%s). "
+                "Reprise dans %d s (tentative %d/%d).",
+                channel.name,
+                e,
+                delay,
+                attempt,
+                MAX_RETRIES,
+            )
+            await asyncio.sleep(delay)
 
 
 @bot.command()
 @allowed_users_only()
+# Un seul comptage à la fois : deux comptages simultanés écriraient dans la même base
+@commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
 async def count(ctx: commands.Context, begin: str, end: str) -> None:
     """
     Commande principale : parcourt tous les salons du serveur sur une période donnée,
@@ -191,26 +327,15 @@ async def count(ctx: commands.Context, begin: str, end: str) -> None:
     # Ouverture d'une seule connexion SQLite pour toute la durée du comptage
     # (plus efficace que d'ouvrir/fermer la connexion à chaque insertion)
     conn = sqlite3.connect(DB_PATH)
+    _create_messages_table(conn)
 
-    # --- Salons textuels ---
-    for channel in server.text_channels:
-        count_messages += await _collect_history(
-            channel,
-            channel.name,
-            "salon",
-            buffer,
-            conn,
-            begin_date,
-            end_date,
-            count_messages,
-        )
-
-        # Fils actifs rattachés au salon
-        for thread in channel.threads:
+    try:
+        # --- Salons textuels ---
+        for channel in server.text_channels:
             count_messages += await _collect_history(
-                thread,
-                thread.name,
-                "fils actif",
+                channel,
+                channel.name,
+                "salon",
                 buffer,
                 conn,
                 begin_date,
@@ -218,43 +343,59 @@ async def count(ctx: commands.Context, begin: str, end: str) -> None:
                 count_messages,
             )
 
-        # Fils archivés rattachés au salon
-        async for thread in channel.archived_threads(limit=None):
-            count_messages += await _collect_history(
-                thread,
-                thread.name,
-                "fils archivé",
-                buffer,
-                conn,
-                begin_date,
-                end_date,
-                count_messages,
-            )
+            # Fils actifs rattachés au salon
+            for thread in channel.threads:
+                count_messages += await _collect_history(
+                    thread,
+                    thread.name,
+                    "fil actif",
+                    buffer,
+                    conn,
+                    begin_date,
+                    end_date,
+                    count_messages,
+                )
 
-    # --- Salons vocaux avec chat textuel ---
-    for voice_channel in server.voice_channels:
-        # last_message_id est None si le salon vocal n'a jamais reçu de message texte
-        if voice_channel.last_message_id:
-            count_messages += await _collect_history(
-                voice_channel,
-                voice_channel.name,
-                "salon vocal",
-                buffer,
-                conn,
-                begin_date,
-                end_date,
-                count_messages,
-            )
+            # Fils archivés rattachés au salon
+            for thread in await _list_archived_threads(channel):
+                count_messages += await _collect_history(
+                    thread,
+                    thread.name,
+                    "fil archivé",
+                    buffer,
+                    conn,
+                    begin_date,
+                    end_date,
+                    count_messages,
+                )
 
-    # Insertion du reste du buffer (inférieur à BUFFER_SIZE)
-    if buffer:
-        _store_buffer(conn, buffer)
+        # --- Salons vocaux avec chat textuel ---
+        for voice_channel in server.voice_channels:
+            # last_message_id est None si le salon vocal n'a jamais reçu de message texte
+            if voice_channel.last_message_id:
+                count_messages += await _collect_history(
+                    voice_channel,
+                    voice_channel.name,
+                    "salon vocal",
+                    buffer,
+                    conn,
+                    begin_date,
+                    end_date,
+                    count_messages,
+                )
+    finally:
+        # Insertion du reste du buffer (inférieur à BUFFER_SIZE), y compris en cas
+        # d'erreur : les messages déjà récupérés ne sont pas perdus.
+        if buffer:
+            _store_buffer(conn, buffer)
+            buffer.clear()
+        conn.close()
 
-    # Mise à jour des statistiques quotidiennes
-    _create_daily_stats_table(conn)
-    _populate_daily_stats(conn)
-
-    conn.close()
+    # Mise à jour des statistiques quotidiennes.
+    # L'agrégation parcourt toute la table messages (plusieurs millions de lignes) :
+    # elle tourne dans un thread séparé pour ne pas bloquer le bot pendant ce temps
+    # (sinon Discord ne reçoit plus les heartbeats et finit par couper la connexion).
+    await asyncio.to_thread(_refresh_daily_stats, DB_PATH)
 
     # Calcul du temps d'exécution total
     elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
@@ -277,10 +418,23 @@ async def count_error(ctx: commands.Context, error: commands.CommandError) -> No
             "❌ Paramètres invalides. Utilise : `/botchan count YYYY-MM-DD YYYY-MM-DD`\n"
             "Exemple : `/botchan count 2026-03-01 2026-03-31`"
         )
+    elif isinstance(error, commands.MaxConcurrencyReached):
+        await ctx.send("⏳ Un comptage est déjà en cours, attends qu'il se termine !")
     elif isinstance(error, commands.CheckFailure):
         pass  # Déjà géré dans allowed_users_only()
     else:
-        await ctx.send(f"❌ Une erreur inattendue s'est produite : {error}")
+        # CommandInvokeError enveloppe l'exception d'origine : on l'extrait pour un
+        # message plus lisible, et on garde la trace complète dans la console.
+        original = getattr(error, "original", error)
+        logger.error(
+            "Erreur pendant la commande count",
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        await ctx.send(
+            f"❌ Une erreur inattendue s'est produite : {type(original).__name__}: {original}\n"
+            "Les messages récupérés avant l'erreur sont enregistrés : "
+            "tu peux relancer la même commande sans risque de doublons."
+        )
 
 
 @bot.command(name="help")
@@ -383,19 +537,14 @@ def _build_row(message: discord.Message, channel_name: str) -> tuple:
     )
 
 
-def _store_buffer(conn: sqlite3.Connection, messages_buffer: list[tuple]) -> None:
+def _create_messages_table(conn: sqlite3.Connection) -> None:
     """
-    Crée la table SQLite si elle n'existe pas, puis insère un lot de messages.
-
-    Utilise INSERT OR IGNORE pour éviter les doublons en cas de relance du comptage
-    sur une période déjà traitée (la clé primaire étant l'ID du message).
+    Crée la table messages si elle n'existe pas encore.
 
     Args:
         conn: La connexion SQLite active.
-        messages_buffer: La liste de tuples à insérer.
     """
-    cur = conn.cursor()
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY,
             author TEXT,
@@ -406,55 +555,64 @@ def _store_buffer(conn: sqlite3.Connection, messages_buffer: list[tuple]) -> Non
             reply_to_message_id INTEGER
         )
     """)
-    try:
-        print(f"Insertion de {len(messages_buffer)} messages dans la table messages.")
-        cur.executemany(
-            "INSERT OR IGNORE INTO messages (id, author, date, content, channel, reactions, reply_to_message_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            messages_buffer,
-        )
-        conn.commit()
-    except sqlite3.Error as e:
-        print(f"Erreur SQL: {e}")
-
-
-def _create_daily_stats_table(conn: sqlite3.Connection) -> None:
-    """
-    Crée la table daily_stats si elle n'existe pas encore.
-
-    Cette table agrège le nombre de messages par jour,
-    calculé à partir des données de la table messages.
-
-    Args:
-        conn: La connexion SQLite active.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            date TEXT PRIMARY KEY,
-            message_count INTEGER
-        )
-    """)
     conn.commit()
 
 
-def _populate_daily_stats(conn: sqlite3.Connection) -> None:
+def _store_buffer(conn: sqlite3.Connection, messages_buffer: list[tuple]) -> None:
     """
-    Remplit la table daily_stats en agrégeant les messages par jour.
+    Insère un lot de messages dans la table messages.
+
+    Utilise INSERT OR IGNORE pour éviter les doublons en cas de relance du comptage
+    sur une période déjà traitée (la clé primaire étant l'ID du message).
+
+    Une erreur SQL n'est pas avalée : elle interrompt le comptage et remonte jusqu'au
+    gestionnaire d'erreurs, plutôt que d'annoncer un comptage réussi alors que
+    des messages n'ont pas été enregistrés.
+
+    Args:
+        conn: La connexion SQLite active.
+        messages_buffer: La liste de tuples à insérer.
+    """
+    logger.info("Insertion de %d messages dans la table messages.", len(messages_buffer))
+    conn.executemany(
+        "INSERT OR IGNORE INTO messages "
+        "(id, author, date, content, channel, reactions, reply_to_message_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        messages_buffer,
+    )
+    conn.commit()
+
+
+def _refresh_daily_stats(db_path: str) -> None:
+    """
+    Crée si besoin puis remplit la table daily_stats en agrégeant les messages par jour.
 
     Utilise INSERT OR REPLACE pour mettre à jour les comptages
     si la commande count est relancée sur une période déjà traitée.
 
+    Ouvre sa propre connexion : la fonction est appelée via asyncio.to_thread(),
+    et une connexion SQLite ne peut pas être partagée entre threads.
+
     Args:
-        conn: La connexion SQLite active.
+        db_path: Chemin vers le fichier SQLite.
     """
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO daily_stats (date, message_count)
-        SELECT date(date), COUNT(*)
-        FROM messages
-        GROUP BY date(date)
-    """)
-    conn.commit()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date TEXT PRIMARY KEY,
+                message_count INTEGER
+            )
+        """)
+        conn.execute("""
+            INSERT OR REPLACE INTO daily_stats (date, message_count)
+            SELECT date(date), COUNT(*)
+            FROM messages
+            GROUP BY date(date)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def main() -> None:
@@ -471,4 +629,5 @@ async def main() -> None:
         await bot.start(token)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -12,7 +12,7 @@ import csv
 from collections import defaultdict
 
 # --- Fichier source ---
-CSV_FILE = "csv/2026_07.csv"
+CSV_FILE = "csv/2026_09.csv"
 
 # --- Critère de matching ---
 PATTERN = re.compile(r"alerte|atome", re.IGNORECASE)
